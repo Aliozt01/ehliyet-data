@@ -8,7 +8,7 @@ Otomatik sınav scraper — GitHub Actions'ta çalışır.
 4. Görselleri ehliyet-imgs repo'ya push eder
 5. exam_data.json ve version.json günceller → ehliyet-data repo'ya push
 """
-import requests, json, time, re, sys, os, hashlib, base64
+import requests, json, time, re, sys, os, hashlib, base64, cloudscraper
 from bs4 import BeautifulSoup
 from datetime import datetime
 from collections import Counter
@@ -188,12 +188,16 @@ def gh_upload_image(img_url, filename):
     return None
 
 # ─── Scraping ─────────────────────────────────────────────────────────
+scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
+
 def fetch(url, method='GET', data=None):
     for _ in range(3):
         try:
             kw = {'headers': HEADERS, 'timeout': 25}
-            r = requests.post(url, data=data, **kw) if method == 'POST' else requests.get(url, **kw)
+            r = scraper.post(url, data=data, **kw) if method == 'POST' else scraper.get(url, **kw)
             r.encoding = 'utf-8'
+            if r.status_code >= 400:
+                print(f"  ⚠️ HTTP {r.status_code} ({url[:50]})", file=sys.stderr)
             return r
         except Exception as e:
             print(f"  ⚠️ fetch hatası ({url[:50]}): {e}", file=sys.stderr)
