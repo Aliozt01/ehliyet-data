@@ -468,7 +468,7 @@ def main():
         
         new_exam = {
             'id': exam_id,
-            'title': info['title'] or f"{parts[2]} {month_name} {year} Ehliyet Sınav Soruları",
+            'title': f"{parts[2]} {month_name} {year} Ehliyet Sınav Soruları",
             'examDate': info['date'],
             'month': f"{year}-{month_num:02d}",
             'year': year,
