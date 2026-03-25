@@ -46,26 +46,120 @@ def gh_headers():
     }
 
 def gh_get_file(repo, path):
-    """GitHub'dan dosya içeriğini ve sha'sını al."""
+    """GitHub'dan dosya içeriğini ve sha'sını al.
+    Büyük dosyalar (>1MB) için raw download URL kullanır.
+    """
     url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/contents/{path}'
     r = requests.get(url, headers=gh_headers())
-    if r.status_code == 200:
-        data = r.json()
-        content = base64.b64decode(data['content']).decode('utf-8')
-        return content, data['sha']
+    if r.status_code != 200:
+        print(f"  ⚠️ gh_get_file HTTP {r.status_code}: {path}", file=sys.stderr)
+        return None, None
+    
+    data = r.json()
+    sha = data.get('sha', '')
+    
+    # Küçük dosyalar: content alanı base64 olarak gelir
+    if 'content' in data and data.get('encoding') == 'base64':
+        try:
+            content = base64.b64decode(data['content']).decode('utf-8')
+            return content, sha
+        except Exception as e:
+            print(f"  ⚠️ base64 decode hatası: {e}", file=sys.stderr)
+    
+    # Büyük dosyalar (>1MB): download_url veya git blob kullan
+    download_url = data.get('download_url')
+    if download_url:
+        print(f"  📦 Büyük dosya, raw URL ile indiriliyor...", file=sys.stderr)
+        r2 = requests.get(download_url, headers={
+            'Authorization': f'token {GITHUB_TOKEN}'
+        }, timeout=60)
+        if r2.status_code == 200:
+            return r2.text, sha
+        else:
+            print(f"  ⚠️ Raw download hatası: HTTP {r2.status_code}", file=sys.stderr)
+    
+    # Fallback: git blob API kullan
+    git_url = data.get('git_url')
+    if git_url:
+        print(f"  📦 Git blob API ile indiriliyor...", file=sys.stderr)
+        r3 = requests.get(git_url, headers=gh_headers())
+        if r3.status_code == 200:
+            blob = r3.json()
+            if blob.get('encoding') == 'base64':
+                content = base64.b64decode(blob['content']).decode('utf-8')
+                return content, sha
+    
+    print(f"  ❌ Dosya indirilemedi: {path}", file=sys.stderr)
     return None, None
 
 def gh_put_file(repo, path, content, message, sha=None):
-    """GitHub'a dosya yükle veya güncelle."""
-    url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/contents/{path}'
-    payload = {
-        'message': message,
-        'content': base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    }
-    if sha:
-        payload['sha'] = sha
-    r = requests.put(url, headers=gh_headers(), json=payload)
-    return r.status_code in (200, 201)
+    """GitHub'a dosya yükle veya güncelle.
+    Büyük dosyalar için Git Data API (blob + tree + commit) kullanır.
+    """
+    content_bytes = content.encode('utf-8')
+    
+    # 50MB'den küçük dosyalar için Contents API dene
+    if len(content_bytes) < 50_000_000:
+        url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/contents/{path}'
+        payload = {
+            'message': message,
+            'content': base64.b64encode(content_bytes).decode('utf-8')
+        }
+        if sha:
+            payload['sha'] = sha
+        r = requests.put(url, headers=gh_headers(), json=payload, timeout=120)
+        if r.status_code in (200, 201):
+            return True
+        print(f"  ⚠️ Contents API put hatası: HTTP {r.status_code}", file=sys.stderr)
+    
+    # Fallback: Git Data API (blob → tree → commit → update ref)
+    print(f"  📦 Git Data API ile yükleniyor...", file=sys.stderr)
+    try:
+        # 1. Blob oluştur
+        blob_url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/git/blobs'
+        blob_r = requests.post(blob_url, headers=gh_headers(), json={
+            'content': base64.b64encode(content_bytes).decode('utf-8'),
+            'encoding': 'base64'
+        }, timeout=120)
+        if blob_r.status_code != 201:
+            print(f"  ❌ Blob oluşturulamadı: {blob_r.status_code}", file=sys.stderr)
+            return False
+        blob_sha = blob_r.json()['sha']
+        
+        # 2. Mevcut HEAD commit'i al
+        ref_url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/git/ref/heads/main'
+        ref_r = requests.get(ref_url, headers=gh_headers())
+        head_sha = ref_r.json()['object']['sha']
+        
+        commit_url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/git/commits/{head_sha}'
+        commit_r = requests.get(commit_url, headers=gh_headers())
+        tree_sha = commit_r.json()['tree']['sha']
+        
+        # 3. Yeni tree oluştur
+        tree_url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/git/trees'
+        tree_r = requests.post(tree_url, headers=gh_headers(), json={
+            'base_tree': tree_sha,
+            'tree': [{'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob_sha}]
+        })
+        new_tree_sha = tree_r.json()['sha']
+        
+        # 4. Yeni commit oluştur
+        new_commit_url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/git/commits'
+        new_commit_r = requests.post(new_commit_url, headers=gh_headers(), json={
+            'message': message,
+            'tree': new_tree_sha,
+            'parents': [head_sha]
+        })
+        new_commit_sha = new_commit_r.json()['sha']
+        
+        # 5. ref güncelle
+        update_r = requests.patch(ref_url, headers=gh_headers(), json={
+            'sha': new_commit_sha
+        })
+        return update_r.status_code == 200
+    except Exception as e:
+        print(f"  ❌ Git Data API hatası: {e}", file=sys.stderr)
+        return False
 
 def gh_upload_image(img_url, filename):
     """Görseli indir ve ehliyet-imgs repo'ya yükle."""
@@ -101,7 +195,8 @@ def fetch(url, method='GET', data=None):
             r = requests.post(url, data=data, **kw) if method == 'POST' else requests.get(url, **kw)
             r.encoding = 'utf-8'
             return r
-        except:
+        except Exception as e:
+            print(f"  ⚠️ fetch hatası ({url[:50]}): {e}", file=sys.stderr)
             time.sleep(2)
     return None
 
@@ -234,16 +329,28 @@ def scrape_exam(url):
 def discover_new_exams(existing_dates):
     """Site ana sayfasından yeni sınav tarihlerini bul."""
     new_dates = []
+    
+    print(f"  Mevcut sınav tarihi sayısı: {len(existing_dates)}", file=sys.stderr)
+    
     r = fetch(BASE_URL)
-    if not r: return new_dates
+    if not r:
+        print("  ❌ Ana sayfa çekilemedi!", file=sys.stderr)
+        return new_dates
+    
+    print(f"  Ana sayfa yanıtı: HTTP {r.status_code}, {len(r.text)} byte", file=sys.stderr)
     
     soup = BeautifulSoup(r.text, 'html.parser')
     links = soup.find_all('a', href=True)
     
+    print(f"  Toplam link sayısı: {len(links)}", file=sys.stderr)
+    
     date_pattern = re.compile(r'e-sinav-(\w+)-sinavi-(\d+)\.html')
+    matched_count = 0
+    
     for link in links:
         m = date_pattern.search(link['href'])
         if m:
+            matched_count += 1
             month_name = m.group(1)
             day = int(m.group(2))
             
@@ -269,7 +376,17 @@ def discover_new_exams(existing_dates):
                         'title': link_text.strip()
                     })
     
-    return new_dates
+    print(f"  Eşleşen link: {matched_count}, Yeni sınav: {len(new_dates)}", file=sys.stderr)
+    
+    # Aynı tarihi tekrar ekleme
+    seen = set()
+    unique = []
+    for d in new_dates:
+        if d['date'] not in seen:
+            seen.add(d['date'])
+            unique.append(d)
+    
+    return unique
 
 def process_images_to_cdn(exam):
     """Sınavdaki görselleri CDN'e yükle ve URL'leri güncelle."""
@@ -283,7 +400,7 @@ def process_images_to_cdn(exam):
                 q['imageUrl'] = cdn_url
         
         # Şık görselleri
-        for letter, choice_text in q.get('choices', {}).items():
+        for letter, choice_text in list(q.get('choices', {}).items()):
             if str(choice_text).startswith('[IMG]'):
                 orig_url = choice_text[5:]
                 if 'ehliyetsinavihazirlik.com' in orig_url:
@@ -309,7 +426,7 @@ def main():
         print(f"  Mevcut: {len(data['exams'])} sınav", file=sys.stderr)
     else:
         data = {'exams': [], 'totalExams': 0, 'totalQuestions': 0}
-        print("  Yeni başlatılıyor...", file=sys.stderr)
+        print("  ⚠️ exam_data.json indirilemedi, boş başlatılıyor...", file=sys.stderr)
     
     # Version bilgisi
     ver_content, ver_sha = gh_get_file(DATA_REPO, 'version.json')
