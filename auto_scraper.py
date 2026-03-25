@@ -127,7 +127,7 @@ def gh_put_file(repo, path, content, message, sha=None):
         blob_sha = blob_r.json()['sha']
         
         # 2. Mevcut HEAD commit'i al
-        ref_url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/git/ref/heads/main'
+        ref_url = f'https://api.github.com/repos/{GITHUB_USER}/{repo}/git/refs/heads/main'
         ref_r = requests.get(ref_url, headers=gh_headers())
         head_sha = ref_r.json()['object']['sha']
         
@@ -470,7 +470,7 @@ def main():
             'id': exam_id,
             'title': info['title'] or f"{parts[2]} {month_name} {year} Ehliyet Sınav Soruları",
             'examDate': info['date'],
-            'month': month_name,
+            'month': f"{year}-{month_num:02d}",
             'year': year,
             'sourceUrl': info['url'],
             'questions': questions
